@@ -24,13 +24,15 @@ plus its backend in ``attention.py``, which folds in the learned sink key using
 the softmax LSE returned by ``npu_fused_infer_attention_score_v2``.
 
 v0 scope: no MTP / speculative decoding, no quantization.
-Run with ``--enforce-eager`` (the sink path is not ACL-graph compatible yet).
+ACL graph mode is supported for decode (``cudagraph_mode`` FULL / FULL_DECODE_ONLY);
+prefill runs eagerly.
 """
 
 from collections.abc import Iterable
 from itertools import islice
 
 import torch
+import torch_npu
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -43,6 +45,10 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
+
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
+from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -115,7 +121,14 @@ def get_layer_sliding_window_size(
 
 
 class IQuestQ1RMSNorm(nn.Module):
-    """RMSNorm (equivalent to T5LayerNorm)."""
+    """RMSNorm (equivalent to T5LayerNorm) backed by the fused Ascend op.
+
+    The reference implementation is a plain torch chain
+    (``to(fp32) -> pow -> mean -> rsqrt -> mul -> to(dtype)``); on NPU that
+    costs 5-7 kernels plus two fp32 copies per invocation, and this module is
+    called ~5 times per layer (~440 times per token). ``torch_npu.npu_rms_norm``
+    does the same math (fp32 accumulation) in a single kernel.
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -123,12 +136,24 @@ class IQuestQ1RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        result = (self.weight * hidden_states).to(input_dtype)
-        return result
+        # npu_rms_norm keeps the fp32 normalization internally and accepts a
+        # bf16/fp32 gamma with bf16 input (Ascend 950). The eps add, rsqrt and
+        # gamma multiply are fused into the same kernel.
+        #
+        # The aclnn op only accepts ND (contiguous) tensors: q/k norms are
+        # applied to per-head views of the fused QKV projection, whose row
+        # stride still spans the full projection. Materialize a contiguous
+        # copy for those; the hidden-size norms are already contiguous.
+        # aclnnRmsNorm only accepts ND (contiguous) tensors and the
+        # (x, gamma) dtypes must match. Normalize unconditionally instead of
+        # branching on dtype/contiguity: torch.compile bakes those Python
+        # branches from the trace-time example, and the MTP draft head can
+        # feed fp32/non-contiguous tensors at replay, which then trips the
+        # aclnn dtype check. Both calls are no-ops when already satisfied.
+        hidden_states = hidden_states.to(self.weight.dtype).contiguous()
+        return torch_npu.npu_rms_norm(
+            hidden_states, self.weight, self.variance_epsilon
+        )[0]
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -151,13 +176,17 @@ class IQuestQ1MoEBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
+        # Router GEMM: keep fp32 *logits* (top-k stability) but compute the
+        # matmul in bf16 with fp32 accumulation. With force_fp32_compute the
+        # weights are stored/computed as fp32 on NPU, which showed up as a
+        # 42 ms fp32 MatMul per 8192-token prefill chunk (~15% of prefill).
         self.gate = GateLinear(
             hidden_size,
             num_experts,
             bias=False,
-            params_dtype=None if router_dtype == torch.float32 else router_dtype,
-            out_dtype=router_dtype,
-            force_fp32_compute=router_dtype == torch.float32,
+            params_dtype=None,
+            out_dtype=torch.float32,
+            force_fp32_compute=False,
             prefix=f"{prefix}.gate",
         )
 
@@ -288,6 +317,16 @@ class IQuestQ1Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        # [L3 perf] Optional fused o_proj GEMM + TP AllReduce (npu_mm_all_reduce_base),
+        # gated by additional_config "enable_fused_o_proj_ar". Unsupported configs
+        # (scheme/TP/weights) are logged once and keep the unfused path.
+        if get_ascend_config().enable_fused_o_proj_ar:
+            if (reason := OProjMMAllReduceOp.unsupported_reason(self.o_proj)) is None:
+                self.o_proj.custom_op = OProjMMAllReduceOp(self.o_proj)
+            else:
+                logger.warning(
+                    "iquest o_proj fused MM+AllReduce disabled for %s: %s", prefix, reason
+                )
 
         self.rotary_dim = getattr(config, "rotary_dim", None)
         rope_parameters = dict(getattr(config, "rope_parameters", None) or {})
@@ -364,6 +403,17 @@ class IQuestQ1Attention(nn.Module):
         else:
             self.k_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        # [L5 perf] Optional Triton strided per-head QK-norm (additional_config
+        # "enable_iquest_triton_qk_norm"): reads q/k straight out of the fused
+        # QKV buffer instead of materializing contiguous head views for
+        # npu_rms_norm. Needs a power-of-two head_dim for tl.arange; the
+        # cross-KV path has no k_norm and stays on the reference route.
+        self.use_triton_qk_norm = bool(
+            get_ascend_config().enable_iquest_triton_qk_norm
+        ) and self.k_norm is not None and (
+            self.head_dim & (self.head_dim - 1) == 0 and self.head_dim >= 16
+        )
+
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
         attn_cls: type[nn.Module] = Attention
         sink_args = {}
@@ -390,6 +440,17 @@ class IQuestQ1Attention(nn.Module):
             prefix=f"{prefix}.attn",
             **sink_args,
         )
+        if is_mtp_layer and real_sliding_window is not None:
+            # The draft checkpoint runs a trained sliding window, but only in
+            # the kernel: the attention impl captured the window at build time
+            # above, so its FIA calls keep sparse_mode=4/pre_tokens. The
+            # KV-cache spec must stay full-attention though: under
+            # --disable-hybrid-kv-cache-manager (required by the Mooncake PD
+            # connector) every layer merges into one group, and
+            # FullAttentionSpec.merge rejects a second distinct window value
+            # next to the target's promoted SWA window. Allocation is full
+            # either way; clearing the module attr only changes the spec view.
+            self.attn.sliding_window = None
 
     def sinks_k_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         replicas = max(1, self.tp_size // self.total_num_kv_heads)
@@ -404,17 +465,30 @@ class IQuestQ1Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-
-        if self.cross_kv_cache:
-            if self.rotary_emb is not None:
-                q, _ = self.rotary_emb(positions, q, None)
-            attn_output = self.attn(q, None, None)
+        if self.use_triton_qk_norm:
+            # Fused strided per-head QK-norm: one Triton launch covers the q
+            # and k rows of the fused QKV buffer with no contiguous copies.
+            # v keeps its strided view exactly like the reference path.
+            q, k = strided_qk_norm(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+            )
+            v = qkv[:, self.q_size + self.kv_size :]
         else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Add qk-norm
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+
+        if not self.cross_kv_cache and not self.use_triton_qk_norm:
+            # Reference path: k is still the raw projection slice here.
+            # (The Triton path above already returned a normalized k.)
             k_by_head = k.view(
                 *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
             )
@@ -422,6 +496,11 @@ class IQuestQ1Attention(nn.Module):
             k_by_head = self.k_norm(k_by_head)
             k = k_by_head.view(k.shape)
 
+        if self.cross_kv_cache:
+            if self.rotary_emb is not None:
+                q, _ = self.rotary_emb(positions, q, None)
+            attn_output = self.attn(q, None, None)
+        else:
             if self.rotary_emb:
                 q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
@@ -677,7 +756,15 @@ class IQuestQ1Model(nn.Module):
                         logger.warning_once("sink attention feature is disabled")
                         continue
 
-                    if "experts.fc" in name:
+                    # ModelSlim quantized checkpoints already name the fused
+                    # expert tensors routed_experts.{w13,w2}_weight[_scale]
+                    # (the fp8 weight plus its E8M0 group scale share the
+                    # same [experts, ...] layout), while bf16 checkpoints
+                    # store them as experts.fc / experts.proj.
+                    if (
+                        "experts.fc" in name
+                        or "experts.routed_experts.w13_weight" in name
+                    ):
                         # Shape: [experts, 2 * intermediate_size, hidden_size].
                         name = name.replace(
                             "experts.fc", "experts.routed_experts.w13_weight"
@@ -712,7 +799,10 @@ class IQuestQ1Model(nn.Module):
                         logger.warning_once("over encoding feature is disabled")
                         continue
 
-                    if "experts.proj" in name:
+                    if (
+                        "experts.proj" in name
+                        or "experts.routed_experts.w2_weight" in name
+                    ):
                         # Shape: [experts, hidden_size, intermediate_size].
                         name = name.replace(
                             "experts.proj", "experts.routed_experts.w2_weight"
@@ -754,6 +844,30 @@ class IQuestQ1Model(nn.Module):
                     if "router.weight" in name:
                         name = name.replace("router.weight", "gate.weight")
 
+                    # ModelSlim KV-recipe tensors reuse the FAKQuant key names
+                    # (fa_v.scale etc., e.g. the static V-cache scale of the
+                    # MXFP8 C8 recipe). With a float KV cache they have no
+                    # parameter to land on, and AutoWeightsLoader's
+                    # ignore_unexpected_suffixes never sees this custom
+                    # loader — drop them here instead. Serving with the
+                    # recipe enabled (--kv-cache-dtype mxfp8) remaps them
+                    # upstream via get_cache_scale_mapper.
+                    if name not in params_dict and name.endswith(
+                        (
+                            ".fa_v.scale",
+                            ".fa_v.offset",
+                            ".fa_q.scale",
+                            ".fa_q.offset",
+                            ".fa_k.scale",
+                            ".fa_k.offset",
+                        )
+                    ):
+                        logger.warning_once(
+                            "Skipping ModelSlim KV-recipe tensor %s: it has no "
+                            "consumer without KV cache quantization.", name
+                        )
+                        continue
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -771,7 +885,15 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             "q_proj",
             "k_proj",
             "v_proj",
-        ]
+        ],
+        # ModelSlim quant descriptions key the dense/shared MLP shards
+        # individually (mlp.gate_proj / mlp.up_proj); without this entry the
+        # fused gate_up_proj resolves to an unquantized module and the fp8
+        # weight is silently downcast while its scale hits a KeyError.
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
     }
 
     def __init__(

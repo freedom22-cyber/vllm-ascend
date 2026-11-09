@@ -808,10 +808,22 @@ class AscendModelSlimConfig(QuantizationConfig):
         layers. Other AttentionLayerBase subclasses (GDN/Mamba, encoder
         attention, ...) must not get the MXFP KV-cache method: they have no
         ``num_kv_heads``/``head_size_v`` and install the QFA backend on the
-        wrong layer type."""
+        wrong layer type.
+
+        Per-layer sliding-window ``Attention`` layers are excluded as well:
+        the C8-MXFP QFA path raises NotImplementedError for sliding-window
+        attention (AscendC8MXFPAttentionBackendImpl), and their
+        SlidingWindowSpec would neither be converted by ``mxfp_cache_spec``
+        nor receive the (k, v, k_scale, v_scale) cache tuple -- the mismatch
+        crashes ``_fill_c8_mxfp_v_scale_caches`` (``cache[3]`` on a raw K/V
+        tuple). Those layers keep their unquantized KV cache instead.
+        """
         from vllm.model_executor.layers.attention import Attention
 
-        return isinstance(layer, Attention)
+        return (
+            isinstance(layer, Attention)
+            and getattr(layer, "sliding_window", None) is None
+        )
 
     @property
     def enable_mxfp_c8_quant(self) -> bool:
@@ -848,6 +860,15 @@ class AscendModelSlimConfig(QuantizationConfig):
             # have no parameter to land on. Without these AutoWeightsLoader
             # rejects the checkpoint outright.
             return (*base, *_MXFP_C8_UNUSED_FA_SUFFIXES)
+        if self._has_mxfp_c8_recipe and not self.enable_fa_quant:
+            # The checkpoint carries the MXFP8 KV recipe but the serve does
+            # not enable it (no --kv-cache-dtype mxfp8): the static V-cache
+            # scale (fa_v.scale, FAKQuant's key reused by the MXFP recipe)
+            # has no parameter to land on with a float KV cache. Sink
+            # attention models must take this path for now — the C8-MXFP
+            # backend does not thread sink weights into quant_flash_attn, so
+            # enabling the recipe would silently drop sink semantics.
+            return (*base, ".fa_v.scale", ".fa_v.offset", *_MXFP_C8_UNUSED_FA_SUFFIXES)
         return base
 
     def get_kv_quant_dtype(self, layer_name, cache_dtype, model_config):

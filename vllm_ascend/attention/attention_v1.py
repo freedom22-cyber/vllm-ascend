@@ -105,6 +105,18 @@ class AscendAttentionBackend(AttentionBackend):
         # out unless they declare support themselves.
         return cls is AscendAttentionBackend
 
+    @classmethod
+    def uses_fia_v2(cls) -> bool:
+        """Whether this backend's updatable-graph FIA tasks call the v2 op.
+
+        The draft-model replay path merges per-layer dicts into the captured
+        task kwargs verbatim (SharedSource), so the key names must match the
+        op variant the backend registered: the v2 op takes TND-style
+        ``actual_seq_qlen``/``actual_seq_kvlen``, the v1 op takes
+        ``actual_seq_lengths``/``actual_seq_lengths_kv``.
+        """
+        return False
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -148,6 +160,17 @@ class AscendAttentionBackend(AttentionBackend):
         if is_minimax_m3_fp8_kv_cache(get_current_vllm_config_or_none()):
             # Keep 128 as a common kernel block with M3 sparse/indexer caches.
             return [MINIMAX_M3_FP8_KV_CACHE_BLOCK_SIZE, 128]
+        # C8-MXFP layers (--kv-cache-dtype mxfp8) use 512-token pages. Without
+        # 512 in this list the hybrid KV manager cannot find a common kernel
+        # block between them and the bf16 sliding-window layers that
+        # --kv-cache-dtype-skip-layers keeps unquantized (ValueError: No
+        # common block size). Keep 128 for those layers.
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
+            from vllm_ascend.utils import is_c8_mxfp_kv_quant
+
+            if is_c8_mxfp_kv_quant(vllm_config):
+                return [512, 128]
         return [128]
 
 
