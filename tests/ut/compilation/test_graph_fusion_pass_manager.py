@@ -18,6 +18,7 @@ class TestGraphFusionPassManagerConfig(TestBase):
             "ascend_compilation_config": {
                 "fuse_norm_quant": "false",
                 "fuse_qknorm_rope": "false",
+                "fuse_add_rms_norm": "false",
                 "fuse_muls_add": "false",
             }
         }

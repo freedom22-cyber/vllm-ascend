@@ -124,6 +124,7 @@ class AscendCompilationConfig:
     enable_super_kernel: bool = False
     fuse_norm_quant: bool = True
     fuse_qknorm_rope: bool = True
+    fuse_add_rms_norm: bool = True
     fuse_muls_add: bool = True
 
     @model_validator(mode="before")
@@ -455,6 +456,7 @@ class AscendConfig:
                 "enable_static_kernel": false,
                 "fuse_norm_quant": true,
                 "fuse_qknorm_rope": true,
+                "fuse_add_rms_norm": true,
                 "fuse_muls_add": true
             },
             "ascend_fusion_config": {
