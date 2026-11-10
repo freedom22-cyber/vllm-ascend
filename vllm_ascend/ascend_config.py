@@ -123,6 +123,10 @@ class AscendCompilationConfig:
     enable_static_kernel: bool = False
     enable_super_kernel: bool = False
     fuse_norm_quant: bool = True
+    # Fold the residual add into the MX-quantized RMSNorm
+    # (aten.add + npu_rms_norm + npu_dynamic_mx_quant -> one kernel). Only
+    # registered on hardware with DYNAMIC_MX_QUANT_FUSION (A5).
+    fuse_add_rms_norm_mx_quant: bool = True
     fuse_qknorm_rope: bool = True
     fuse_add_rms_norm: bool = True
     fuse_muls_add: bool = True
@@ -441,7 +445,7 @@ class AscendConfig:
             "enable_fused_mc2": 0,
             "enable_fused_o_proj_ar": 0,
             "enable_iquest_triton_qk_norm": 0,
-            "enable_iquest_split_qkv_rmsnorm_rope": 0,
+            "enable_iquest_split_qkv_rmsnorm_rope": 1,
             "enable_mlapo": true,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
@@ -455,6 +459,7 @@ class AscendConfig:
                 "enable_npugraph_ex": true,
                 "enable_static_kernel": false,
                 "fuse_norm_quant": true,
+                "fuse_add_rms_norm_mx_quant": true,
                 "fuse_qknorm_rope": true,
                 "fuse_add_rms_norm": true,
                 "fuse_muls_add": true
@@ -620,8 +625,9 @@ class AscendConfig:
     # 1 = replace the iquest_q1 per-head q/k RMSNorm + NeoX RoPE chain with the
     # fused split_qkv_rmsnorm_rope kernel (DeviceOperator, SIMT on A5). The
     # fused path also emits contiguous q/k/v, so it subsumes the strided
-    # QK-norm kernel above. Model-scoped opt-in (iquest_q1 attention only).
-    enable_iquest_split_qkv_rmsnorm_rope: int = 0
+    # QK-norm kernel above. Enabled by default for iquest_q1; set 0 to fall
+    # back to the unfused chain.
+    enable_iquest_split_qkv_rmsnorm_rope: int = 1
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have

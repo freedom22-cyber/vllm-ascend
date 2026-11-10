@@ -60,7 +60,12 @@ class GraphFusionPassManager:
         ):
             from .passes.norm_quant_fusion_pass import AddRMSNormQuantFusionPass
 
-            self.passes.append(AddRMSNormQuantFusionPass(config))
+            self.passes.append(
+                AddRMSNormQuantFusionPass(
+                    config,
+                    fuse_add_rms_norm_mx_quant=self.ascend_compilation_config.fuse_add_rms_norm_mx_quant,
+                )
+            )
 
         if self.ascend_compilation_config.fuse_qknorm_rope:
             from .passes.qknorm_rope_fusion_pass import QKNormRopeFusionPass

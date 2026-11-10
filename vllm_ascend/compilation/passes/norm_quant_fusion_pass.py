@@ -646,7 +646,7 @@ class AddRMSNormQuantFusionPass(VllmInductorPass):
       where the add reaches the RMSNorm as a plain ``aten.add``.
     """
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(self, vllm_config: VllmConfig, fuse_add_rms_norm_mx_quant: bool = True):
         super().__init__(vllm_config)
         self.pattern_match_passes: PatternMatcherPass = PatternMatcherPass(pass_name="rmsnorm_quant_fusion_pass")
 
@@ -671,12 +671,17 @@ class AddRMSNormQuantFusionPass(VllmInductorPass):
             if profile.supports(HardwareCapability.DYNAMIC_MX_QUANT_FUSION):
                 # The three-op rules must be registered before the two-op
                 # RMSNorm+quant rule, otherwise the latter strips the RMSNorm
-                # and the residual add cannot be folded anymore.
-                AddResidualRMSNormDynamicMXQuantPattern(vllm_config, eps=eps).register(self.pattern_match_passes)
-                if eps == _NPU_RMS_NORM_DEFAULT_EPS:
-                    AddResidualRMSNormDynamicMXQuantImplicitEpsPattern(
-                        vllm_config, eps=eps
-                    ).register(self.pattern_match_passes)
+                # and the residual add cannot be folded anymore. The dedicated
+                # switch lets users keep the two-op MX fusion but skip the
+                # residual-add variant.
+                if fuse_add_rms_norm_mx_quant:
+                    AddResidualRMSNormDynamicMXQuantPattern(vllm_config, eps=eps).register(
+                        self.pattern_match_passes
+                    )
+                    if eps == _NPU_RMS_NORM_DEFAULT_EPS:
+                        AddResidualRMSNormDynamicMXQuantImplicitEpsPattern(
+                            vllm_config, eps=eps
+                        ).register(self.pattern_match_passes)
                 AddRMSNormDynamicMXQuantPattern(vllm_config, eps=eps).register(self.pattern_match_passes)
                 RMSNormDynamicMXQuantPattern(vllm_config, eps=eps).register(self.pattern_match_passes)
             if enable_custom_op():

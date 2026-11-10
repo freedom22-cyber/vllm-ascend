@@ -58,7 +58,7 @@ def make_vllm_config():
     return vllm_config
 
 
-def build_pass(pass_module, device_type):
+def build_pass(pass_module, device_type, fuse_add_rms_norm_mx_quant=True):
     """Instantiate the pass and return the (class name, eps) registration order."""
     calls = []
 
@@ -74,7 +74,9 @@ def build_pass(pass_module, device_type):
         patch.object(pass_module, "enable_custom_op", return_value=False),
         patch.object(pass_module.BasePattern, "register", record),
     ):
-        pass_module.AddRMSNormQuantFusionPass(make_vllm_config())
+        pass_module.AddRMSNormQuantFusionPass(
+            make_vllm_config(), fuse_add_rms_norm_mx_quant=fuse_add_rms_norm_mx_quant
+        )
     return calls
 
 
@@ -99,6 +101,17 @@ def test_three_op_mx_pattern_registered_before_two_op_pattern(pass_module):
     for eps in (1e-5, 1e-6):
         implicit = [name for name, registered_eps in calls if registered_eps == eps]
         assert ("AddResidualRMSNormDynamicMXQuantImplicitEpsPattern" in implicit) == (eps == 1e-6)
+
+
+def test_residual_three_op_patterns_can_be_disabled(pass_module):
+    """The dedicated switch keeps the two-op MX fusion but skips add+norm+quant."""
+    calls = build_pass(pass_module, AscendDeviceType.A5, fuse_add_rms_norm_mx_quant=False)
+
+    names = {name for name, _ in calls}
+    assert "AddResidualRMSNormDynamicMXQuantPattern" not in names
+    assert "AddResidualRMSNormDynamicMXQuantImplicitEpsPattern" not in names
+    assert "AddRMSNormDynamicMXQuantPattern" in names
+    assert "RMSNormDynamicMXQuantPattern" in names
 
 
 def test_mx_patterns_skipped_without_dynamic_mx_quant_capability(pass_module):
