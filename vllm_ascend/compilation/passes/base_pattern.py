@@ -44,6 +44,27 @@ class BasePattern(ABC):
     def get_extra_stream_scope_check(self):
         return extra_stream_scope_check
 
+    def get_extra_check(self):
+        """Optional shape/dtype guard evaluated on every real match.
+
+        The inductor matcher only compares operator targets and argument
+        structure, so patterns whose replacement has stricter input contracts
+        than the matched ops (for example same-shape additions) can override
+        this to reject incompatible matches.
+        """
+        return None
+
+    def get_search_fn_pattern(self):
+        """Optional pre-built pattern used instead of tracing ``get_pattern``.
+
+        Dynamo keeps custom-op calls as ``torch.ops.<ns>.<op>`` packets while
+        ``make_fx`` records the resolved ``<op>.default`` overload, so a
+        normally traced pattern can only match one of the two graph forms.
+        A pattern built from a packet target keeps the packet and all of its
+        overloads in the target set and matches either form.
+        """
+        return None
+
     def pattern_key(self) -> str:
         return f"{self.__class__.__name__}_{self.eps}"
 
@@ -70,16 +91,40 @@ class BasePattern(ABC):
         # separately: a pattern that fails to register must stay retryable, and a
         # failure in one registry must not suppress the other. Record the key only
         # after the registration actually succeeded.
+        search_fn_pattern = self.get_search_fn_pattern()
+        extra_check = self.get_extra_check()
+
         if pattern_id not in registered:
-            pm.register_replacement(pattern_fn, replacement_fn, example_inputs, pm.fwd_only, pm_pass)
+            register_kwargs = {}
+            if extra_check is not None:
+                register_kwargs["extra_check"] = extra_check
+            if search_fn_pattern is not None:
+                register_kwargs["search_fn_pattern"] = search_fn_pattern
+            pm.register_replacement(
+                pattern_fn, replacement_fn, example_inputs, pm.fwd_only, pm_pass, **register_kwargs
+            )
             registered.add(pattern_id)
 
         if pattern_id not in _registered_patterns:
+            stream_scope_check = self.get_extra_stream_scope_check()
+            own_extra_check = self.get_extra_check()
+
+            def nge_extra_check(match) -> bool:
+                # The npugraph_ex registry applies its own stream/scope checks
+                # around this callback; keep the legacy stream check for older
+                # backends and add the pattern's own shape/dtype guard.
+                if not stream_scope_check(match):
+                    return False
+                return True if own_extra_check is None else own_extra_check(match)
+
+            nge_kwargs = {"extra_check": nge_extra_check}
+            if search_fn_pattern is not None:
+                nge_kwargs["search_fn_pattern"] = search_fn_pattern
             nge.register_replacement(
                 search_fn=pattern_fn,
                 replace_fn=replacement_fn,
                 example_inputs=example_inputs,
-                extra_check=self.get_extra_stream_scope_check(),
+                **nge_kwargs,
             )
             # Mark this pattern as registered in the global backend registry
             _registered_patterns.add(pattern_id)
