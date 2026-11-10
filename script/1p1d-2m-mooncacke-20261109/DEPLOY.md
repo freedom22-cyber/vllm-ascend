@@ -1,10 +1,11 @@
-# 部署步骤 — 1P1D 双机 PD 分离（mooncacke 站，2026-11-10 实测版）
+# 部署与配置归档 — 1P1D 双机 PD 分离（mooncacke 站，2026-11-10）
 
-> 背景/架构说明见同目录 `README.md`（早期拓扑时代的文档，IP 等以本文为准）。
+> 本文件 = 部署步骤 runbook + 生效配置完整归档（原
+> `PD_mooncacke_1p1d_配置归档_20261110.md` 并入，2026-11-10 起 DEPLOY.md 为唯一部署文档）。
+> 背景/架构见同目录 `README.md`（早期拓扑时代文档，IP 等以本文为准）。
 > 当前实测拓扑：**P0=new2 10.222.42.240 / D0=new8 10.222.41.88**，容器
 > `pd-mooncacke-p` / `pd-mooncacke-d`，代码 `releases/v0.30.0`（vllm_ascend 经
-> PYTHONPATH 从 /workspace 加载）。配置归档详见
-> `docs/PD_mooncacke_1p1d_配置归档_20261110.md`（工作区 docs/）。
+> PYTHONPATH 从 /workspace 加载）。
 
 ## 0. 拓扑与约定
 
@@ -108,7 +109,7 @@ docker exec pd-mooncacke-p pkill -f '[m]ooncake_master'
 
 | 症状 | 根因 | 处置 |
 |---|---|---|
-| worker spawn 阶段 `ModuleNotFoundError: No module named 'acl'`，EngineCore 卡死 | `export PYTHONPATH=/workspace` 整体覆盖冲掉了 CANN set_env 注入的 toolkit python 路径（spawn worker 里 camem.py `from acl.rt import memcpy` 失败） | launch_static.sh 已改为追加式 `${PYTHONPATH:-}:/workspace`；若再见到覆盖式写法即回退此坑 |
+| worker spawn 阶段 `ModuleNotFoundError: No module named 'acl'`，EngineCore 卡死 | `export PYTHONPATH=/workspace` 整体覆盖冲掉了 CANN set_env 注入的 toolkit python 路径（spawn worker 里 camem.py `from acl.rt import memcpy` 失败，事故现场 P 侧 14:44 CST） | launch_static.sh 已改为追加式 `${PYTHONPATH:-}:/workspace`；若再见到覆盖式写法即回退此坑 |
 | decode 启动 pydantic 报 "no config.json" | D 侧 eagle 草稿 `/models/IQuest-Q1/mtp` 不存在（容器 /models 只链了量化主模型） | 补 `ln -sfn /mnt/sfs_turbo/models/IQuest-Q1 /models/IQuest-Q1`（容器内） |
 | 进程列表有 `vllm serve` 但 7100 无监听、NPU 无占卡 | **假绿**：上次启动死在 spawn 阶段的残留僵尸（Ctrl+C 只杀了会话没杀引擎） | 先 `pkill -KILL -f 'VLLM::|vllm serve'` 清干净、确认 NPU 释放，再重启 |
 
@@ -119,21 +120,82 @@ docker exec pd-mooncacke-p pkill -f '[m]ooncake_master'
 - 容器 `/pd/logs` 是容器层真实目录（--rm 即丢），引擎日志又不落盘 → 重要日志在打屏
   终端里重定向留存。
 
-## 6. 配置速查
+## 6. 生效配置完整归档（2026-11-10 15:00–15:15 实测，以进程实际命令行为准）
 
-| 项 | P（prefill/launch_static.sh） | D（decode/launch_static.sh） |
-|---|---|---|
-| 模型 | IQuest-Q1-W8A8C8-mxfp8 + `--quantization ascend`（KV=float，C8 未启用） | 同左 |
-| 并行 | TP8 + EP，eager | TP8 + EP，FULL_DECODE_ONLY 图 25 档 |
-| 上下文/批次 | 112024 / 32768 tok / seqs 8 | 131072 / 192 tok / seqs 6 |
-| KV 显存 | util 0.90 | pin 32GiB（`--kv-cache-memory`）+ util 0.94 |
-| MTP | 无 | eagle depth3 `/models/IQuest-Q1/mtp` |
-| 连接器 | MooncakeHybridConnector(producer 28010) + AscendStoreConnector(池) | 同形 consumer 29010 |
-| 池化 | ENABLE_KV_POOL=1，master 50088，segment 24GB/卡 | 同左 |
+### 6.1 mooncake_master（P0，new2）
 
-当前为 **4.4/4.5 纯P/纯D 配比测试冻结值**。恢复生产值：
-P → `--max-num-seqs 32 --max-num-batched-tokens 8192 --max-model-len 131072`；
-D → `--max-num-seqs 256 --max-num-batched-tokens 1024`；
-同步清理 `env.override.sh` 尾部冻结块（避免 launch_engine.sh 路径与之不一致）。
+```text
+/usr/local/python3.12.16/.../mooncake/mooncake_master \
+  --port 50088 --eviction_high_watermark_ratio 0.9 \
+  --eviction_ratio 0.1 --default_kv_lease_ttl 11000
+```
+- 由 `bash /pd/mooncake/run_master.sh` 拉起；配置 `/pd/mooncake/mooncake.json`：
+  master_server_address=10.222.42.240:50088、global_segment_size=24GB、
+  metadata_server=P2PHANDSHAKE、protocol=ascend
+- ENABLE_KV_POOL=1（env.pool.override.sh）；池化启动顺序 master → decode → prefill → proxy
+
+### 6.2 Prefill（new2:7100）
+
+启动：`docker exec -d pd-mooncacke-p bash /pd/prefill/launch_static.sh`
+
+| 项 | 值 |
+|---|---|
+| 模型 | `/models/IQuest-Q1-W8A8C8-mxfp8` + `--quantization ascend`（W8A8，**KV=float，C8 未启用**） |
+| 并行 | TP8 × DP1 + `--enable-expert-parallel` |
+| 模式 | `--enforce-eager`（P 侧无图模式） |
+| 上下文 | `--max-model-len 112024`（110k/1k 口径） |
+| 批次 | `--max-num-batched-tokens 32768`、`--max-num-seqs 8` |
+| block_size | 128 |
+| 显存 | `--gpu-memory-utilization 0.90` |
+| 缓存 | `--enable-prefix-caching`（池查找依赖）+ `--disable-hybrid-kv-cache-manager` |
+| KV 传输 | MultiConnector(producer, kv_port 28010, engine_id 0) = MooncakeHybridConnector + AscendStoreConnector(backend mooncake, use_layerwise=false) |
+| additional_config | `{"enable_fused_mc2":1,"enable_iquest_triton_qk_norm":1,"enable_fused_o_proj_ar":1}` |
+| profiler | torch → `/pd/logs/profile/prefill` |
+
+### 6.3 Decode（new8:7100）
+
+启动：`docker exec -d pd-mooncacke-d bash /pd/decode/launch_static.sh`
+
+| 项 | 值 |
+|---|---|
+| 模型 | 同 P（W8A8C8-mxfp8，KV=float） |
+| 并行 | TP8 + EP8 |
+| 模式 | 图模式 **FULL_DECODE_ONLY**，cudagraph_capture_sizes 25 档 `[1,2,4,8,16,24,32,48,64,80,96,112,128,160,192,224,256,320,384,448,512,640,768,896,1024]`；`ascend_compilation_config.enable_npugraph_ex=true, enable_static_kernel=false` |
+| 上下文 | `--max-model-len 131072` |
+| 批次 | `--max-num-batched-tokens 192`、`--max-num-seqs 6`（5890 blocks×128÷111,024≈6.79→6，88% 占用） |
+| KV 显存 | 显式 pin `--kv-cache-memory 34359738368`（32GiB） |
+| 显存 | `--gpu-memory-utilization 0.94` |
+| MTP | `--speculative-config {"method":"eagle","model":"/models/IQuest-Q1/mtp","num_speculative_tokens":3}` |
+| 调度 | `--async-scheduling`（on） |
+| prefix caching | 关 |
+| KV 传输 | MultiConnector(consumer, kv_port 29010, engine_id 1) = 同款两连接器 |
+| additional_config | `{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false},"enable_cpu_binding":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable":true,"enable_fused_mc2":1,"enable_iquest_triton_qk_norm":1,"enable_fused_o_proj_ar":1}` |
+| profiler | torch → `/pd/logs/profile/decode` |
+
+### 6.4 Proxy（P0，new2:1999）
+
+启动：`docker exec -d pd-mooncacke-p bash /pd/run_proxy.sh`
+- 镜像自带 `examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py`
+- 路由：prefill=10.222.42.240:7100，decode=10.222.41.88:7100
+
+## 7. 配置速查与恢复生产值
+
+当前为 **4.4/4.5 纯P/纯D 配比测试冻结值**。恢复生产值（脚本头部注释原话）：
+- P：`--max-num-seqs 32 --max-num-batched-tokens 8192 --max-model-len 131072`
+- D：`--max-num-seqs 256 --max-num-batched-tokens 1024`
+- 同步清理 `env.override.sh` 尾部"4.4/4.5 配比测试"冻结块（PREFILL_MAX_NUM_SEQS=8 等），
+  否则 launch_engine.sh 路径启动会与 launch_static.sh 不一致。
 
 切换引擎代码：改容器内 `/workspace` 符号链接指向目标 worktree → 重启引擎（脚本不用动）。
+
+## 8. 另存：当天上午的手动配置变体（11:48 CST 成功跑通）
+
+容器本地 `engine-current.log`（UTC 03:48）记录的一次成功启动，与上文冻结配置
+**不是一套**，注意区分：
+- 端口 7200；max_model_len 65535；max_num_batched_tokens 16384；max_num_seqs 64；block_size **512**
+- **KV C8 启用**：`--kv-cache-dtype mxfp8 --kv-cache-dtype-skip-layers sliding_window`
+- 连接器 **MooncakeConnectorV1**（非 MooncakeHybridConnector）+ AscendStoreConnector
+- additional_config 含 `enable_flashcomm1`、`enable_cpu_binding`、`recompute_scheduler_enable`
+- async_scheduling on；enforce_eager；env 出现过 VLLM_ASCEND_ENABLE_FLASHCOMM1 /
+  VLLM_ASCEND_ENABLE_PREFETCH_MLP / VLLM_RPC_TIMEOUT（镜像报 unknown 警告）
+- 走镜像自带 vllm_ascend（当时 /workspace 链接尚未建好）
