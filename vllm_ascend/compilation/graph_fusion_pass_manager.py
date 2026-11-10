@@ -60,12 +60,24 @@ class GraphFusionPassManager:
         ):
             from .passes.norm_quant_fusion_pass import AddRMSNormQuantFusionPass
 
-            self.passes.append(AddRMSNormQuantFusionPass(config))
+            self.passes.append(
+                AddRMSNormQuantFusionPass(
+                    config,
+                    fuse_add_rms_norm_mx_quant=self.ascend_compilation_config.fuse_add_rms_norm_mx_quant,
+                )
+            )
 
         if self.ascend_compilation_config.fuse_qknorm_rope:
             from .passes.qknorm_rope_fusion_pass import QKNormRopeFusionPass
 
             self.passes.append(QKNormRopeFusionPass(config))
+
+        # Must run before muls_add: the dominant residual+norm shape is
+        # x + branch * scale, and muls_add would fold the mul and add first.
+        if self.ascend_compilation_config.fuse_add_rms_norm:
+            from .passes.add_rms_norm_fusion_pass import AddRMSNormFusionPass
+
+            self.passes.append(AddRMSNormFusionPass(config))
 
         if self.ascend_compilation_config.fuse_muls_add and profile.supports(HardwareCapability.GRAPH_MULS_ADD_FUSION):
             from .passes.muls_add_pass import MulsAddFusionPass
