@@ -47,6 +47,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.linear_op import OProjMMAllReduceOp
 from vllm_ascend.ops.triton.iquest_qk_norm import strided_qk_norm
 from vllm.model_executor.layers.attention import Attention
@@ -255,6 +256,34 @@ class IQuestQ1DenseMLP(nn.Module):
         return out
 
 
+def _can_use_split_qkv_rmsnorm_rope(
+    *,
+    enabled: bool,
+    k_norm: nn.Module | None,
+    rotary_emb: nn.Module | None,
+    head_dim: int,
+) -> bool:
+    """Whether the fused split+RMSNorm+RoPE kernel may replace this layer's chain.
+
+    The kernel reads the fused QKV projection directly, so it subsumes both the
+    per-head q/k norm and the split itself. It needs a power-of-two head
+    dimension for its ``tl.arange`` tiles and the NeoX-layout cos/sin cache
+    that vLLM builds for (partial) RoPE layers. Layers with shared KV have no
+    ``k_norm``, and layers without RoPE have no cache; both stay on the
+    reference path.
+    """
+    if not enabled or k_norm is None or rotary_emb is None:
+        return False
+    if head_dim <= 0 or head_dim & (head_dim - 1):
+        return False
+    if not getattr(rotary_emb, "is_neox_style", False):
+        return False
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    if cache is None or cache.dim() != 2 or cache.shape[-1] != rotary_emb.rotary_dim:
+        return False
+    return True
+
+
 class IQuestQ1Attention(nn.Module):
     def __init__(
         self,
@@ -413,7 +442,16 @@ class IQuestQ1Attention(nn.Module):
         ) and self.k_norm is not None and (
             self.head_dim & (self.head_dim - 1) == 0 and self.head_dim >= 16
         )
-
+        # [L5 perf] Optional fused split+RMSNorm+RoPE (additional_config
+        # "enable_iquest_split_qkv_rmsnorm_rope"): a single kernel replaces the
+        # split, both per-head norms and the rotary embedding, writing
+        # contiguous q/k/v. Takes precedence over the strided QK-norm kernel.
+        self.use_split_qkv_rmsnorm_rope = _can_use_split_qkv_rmsnorm_rope(
+            enabled=bool(get_ascend_config().enable_iquest_split_qkv_rmsnorm_rope),
+            k_norm=self.k_norm,
+            rotary_emb=self.rotary_emb,
+            head_dim=self.head_dim,
+        )
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
         attn_cls: type[nn.Module] = Attention
         sink_args = {}
@@ -465,7 +503,25 @@ class IQuestQ1Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.use_triton_qk_norm:
+        if self.use_split_qkv_rmsnorm_rope:
+            # One kernel: split [q|k|v], per-head RMSNorm on q/k, NeoX RoPE.
+            # The reference path below materializes contiguous q/k views for
+            # npu_rms_norm and then launches a separate rotary embedding.
+            assert self.k_norm is not None
+            q, k, v = DeviceOperator.split_qkv_rmsnorm_rope(
+                input=qkv,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
+                q_bias=None,
+                k_bias=None,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+            )
+        elif self.use_triton_qk_norm:
             # Fused strided per-head QK-norm: one Triton launch covers the q
             # and k rows of the fused QKV buffer with no contiguous copies.
             # v keeps its strided view exactly like the reference path.
@@ -486,9 +542,13 @@ class IQuestQ1Attention(nn.Module):
             q_by_head = self.q_norm(q_by_head)
             q = q_by_head.view(q.shape)
 
-        if not self.cross_kv_cache and not self.use_triton_qk_norm:
+        if (
+            not self.cross_kv_cache
+            and not self.use_triton_qk_norm
+            and not self.use_split_qkv_rmsnorm_rope
+        ):
             # Reference path: k is still the raw projection slice here.
-            # (The Triton path above already returned a normalized k.)
+            # Both fused paths above already returned a normalized k.
             k_by_head = k.view(
                 *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
             )
@@ -501,7 +561,8 @@ class IQuestQ1Attention(nn.Module):
                 q, _ = self.rotary_emb(positions, q, None)
             attn_output = self.attn(q, None, None)
         else:
-            if self.rotary_emb:
+            # The fused path above already applied RoPE to q and k.
+            if self.rotary_emb and not self.use_split_qkv_rmsnorm_rope:
                 q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)

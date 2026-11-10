@@ -440,6 +440,7 @@ class AscendConfig:
             "enable_fused_mc2": 0,
             "enable_fused_o_proj_ar": 0,
             "enable_iquest_triton_qk_norm": 0,
+            "enable_iquest_split_qkv_rmsnorm_rope": 0,
             "enable_mlapo": true,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
@@ -614,6 +615,11 @@ class AscendConfig:
     # fused QKV buffer, skipping the contiguous copies npu_rms_norm forces
     # per call. Model-scoped opt-in (iquest_q1 attention only).
     enable_iquest_triton_qk_norm: int = 0
+    # 1 = replace the iquest_q1 per-head q/k RMSNorm + NeoX RoPE chain with the
+    # fused split_qkv_rmsnorm_rope kernel (DeviceOperator, SIMT on A5). The
+    # fused path also emits contiguous q/k/v, so it subsumes the strided
+    # QK-norm kernel above. Model-scoped opt-in (iquest_q1 attention only).
+    enable_iquest_split_qkv_rmsnorm_rope: int = 0
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have
