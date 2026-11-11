@@ -60,6 +60,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
+    is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
@@ -331,7 +332,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             )
             continue
 
-        if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
+        # Convert only the layers that really store MXFP8. The MTP draft keeps
+        # a BF16 FullAttentionSpec (model.py clears its module-level sliding
+        # window so it does not fight the target's promoted windows), and
+        # --kv-cache-dtype-skip-layers layers are BF16 too; rewriting those to
+        # the packet-packed FP8 layout made the BF16 kernels write into an FP8
+        # cache (Invalid_Argument_Tensor_Dtype in ScatterPaKvCache).
+        if is_c8_mxfp_kv_quant(vllm_config) and is_mxfp_cache_spec(spec):
             spec = mxfp_cache_spec(spec)
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
@@ -1577,7 +1584,9 @@ def _reshape_kv_cache_v2(
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
 
-            if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
+            # Per-layer spec, not the global cache_dtype: skip-quantized
+            # (BF16) layers reach here as promoted FullAttentionSpecs.
+            if is_mxfp_cache_spec(kv_cache_spec):
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")

@@ -4697,7 +4697,14 @@ class NPUModelRunner(GPUModelRunner):
         return tensor[int(offset) :]
 
     def _is_c8_mxfp_kv_cache(self, spec: AttentionSpec) -> bool:
-        return type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(self.vllm_config)
+        # The dtype, not the global flag: --kv-cache-dtype-skip-layers keeps
+        # some layers on BF16 and vLLM promotes their SlidingWindowSpec to
+        # FullAttentionSpec when the layers share one block pool.
+        return (
+            type(spec) is FullAttentionSpec
+            and is_c8_mxfp_kv_quant(self.vllm_config)
+            and spec.dtype == torch.float8_e4m3fn
+        )
 
     def _fill_c8_mxfp_v_scale_caches(self, kv_caches: dict[str, Any]) -> None:
         """Initialize V scales and retain views for physical-page reassignment.
