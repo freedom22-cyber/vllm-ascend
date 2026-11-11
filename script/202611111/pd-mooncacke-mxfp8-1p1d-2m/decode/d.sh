@@ -9,11 +9,10 @@
 # ⚠️ 启动顺序: master(46.181) → 本脚本 → prefill(46.181) → proxy
 #    本脚本的 MTP 草稿模型走 /models/IQuest-Q1/mtp，容器需挂该项（见 README §3）
 #
-# ⚠️ 当前取值（2026-11-10 二改）：
-#    max-num-seqs 6 / max-num-batched-tokens 32768 / max-model-len 524288（模型原生上限）
-#    早期 4.4/4.5 配比测试用的是 batched-tokens 192；注意本脚本同时 pin 了
-#    --kv-cache-memory 32GiB，32768 的 chunked-prefill 上界与 6 条并发是否装得下需实测
-#    （旧 env.override.sh 冻结块归档在 archive/legacy/）
+# ⚠️ 当前取值（2026-11-11 三改，对齐 4m 站）：
+#    max-num-batched-tokens 256 / max-num-seqs 64 / max-model-len 524288（模型原生上限）
+#    不再 pin --kv-cache-memory，KV 容量由 --gpu-memory-utilization 0.94 自动推导
+#    （4m 站 decode 同为 256/64；旧 env.override.sh 冻结块归档在 archive/legacy/）
 # =====================================================================
 set -Eeuo pipefail
 
@@ -85,7 +84,7 @@ exec /usr/local/python3.12.16/bin/vllm serve /models/IQuest-Q1-W8A8C8-mxfp8 \
     --served-model-name IQuest-Q1 \
     --tensor-parallel-size 8 \
     --max-model-len 524288 \
-    --max-num-batched-tokens 1024 \
+    --max-num-batched-tokens 256 \
     --max-num-seqs 64 \
     --block-size 128 \
     --no-enable-prefix-caching \
@@ -97,10 +96,9 @@ exec /usr/local/python3.12.16/bin/vllm serve /models/IQuest-Q1-W8A8C8-mxfp8 \
     --disable-hybrid-kv-cache-manager \
     --kv-transfer-config '{"kv_connector":"MultiConnector","kv_role":"kv_consumer","kv_port":29010,"engine_id":"1","kv_connector_extra_config":{"connectors":[{"kv_connector":"MooncakeHybridConnector","kv_role":"kv_consumer","kv_port":29010,"kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":8},"decode":{"dp_size":1,"tp_size":8}}},{"kv_connector":"AscendStoreConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"lookup_rpc_port":"0","backend":"mooncake","use_layerwise":false}}]}}' \
     --speculative-config '{"method":"eagle","model":"/models/IQuest-Q1/mtp","num_speculative_tokens":3}' \
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,24,32,48,64,80,96,112,128,160,192,224,256]}' \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16,24,32,48,64,80,96,112,128]}' \
     --async-scheduling \
     --additional-config '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false},"enable_cpu_binding":true,"multistream_overlap_shared_expert":true,"recompute_scheduler_enable":true,"enable_fused_mc2":1,"enable_iquest_triton_qk_norm":1,"enable_fused_o_proj_ar":1}' \
     --profiler-config '{"profiler":"torch","torch_profiler_dir":"/pd/logs/profile/decode","torch_profiler_with_stack":false}' \
-    --kv-cache-memory 34359738368 \
     --enable-expert-parallel \
     --quantization ascend

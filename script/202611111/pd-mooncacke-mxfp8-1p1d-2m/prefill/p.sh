@@ -10,10 +10,11 @@
 #    master 必须先起（引擎初始化即连 50088）:
 #    docker exec -d pd-mooncacke-p bash /pd/mooncake/run_master.sh
 #
-# ⚠️ 当前取值（2026-11-10 二改）：
-#    max-num-seqs 8 / max-num-batched-tokens 32768 / max-model-len 524288（模型原生上限）
-#    早期 4.4/4.5 配比测试用的是 max-model-len 112024；改回长上下文以外的旧口径见
-#    archive/docs/DEPLOY.完整归档.md（旧 env.override.sh 冻结块归档在 archive/legacy/）
+# ⚠️ 当前取值（2026-11-11 三改，对齐 4m 站）：
+#    max-num-seqs 32 / max-num-batched-tokens 32768 / max-model-len 524288（模型原生上限）
+#    同步开 --async-scheduling；additional_config 增补 enable_flashcomm1 / enable_cpu_binding /
+#    multistream_overlap_shared_expert；不再设 VLLM_WORKER_MULTIPROC_METHOD（默认 fork）。
+#    改回长上下文以外的旧口径见 archive/docs/DEPLOY.完整归档.md（旧 env.override.sh 冻结块归档在 archive/legacy/）
 # =====================================================================
 set -Eeuo pipefail
 
@@ -52,8 +53,8 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONUNBUFFERED=1
 export PYTHONHASHSEED=0
-# vLLM 默认 fork；本站沿用 spawn（spawn 会重新 import，故 PYTHONPATH 必须追加式）
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
+# 对齐 4m 站（2026-11-11 三改）：不设 VLLM_WORKER_MULTIPROC_METHOD，走 vLLM 默认 fork。
+# 若回退 spawn，需保留追加式 PYTHONPATH（spawn 会重新 import，覆盖式会让 worker 找不到 acl）。
 
 # ---- mooncake 传输引擎 .so（追加，不覆盖镜像/CANN 的库路径）----
 export LD_LIBRARY_PATH=/usr/local/python3.12.16/lib/python3.12/site-packages/mooncake:/usr/local/lib/:${LD_LIBRARY_PATH:-}
@@ -75,7 +76,7 @@ exec /usr/local/python3.12.16/bin/vllm serve /models/IQuest-Q1-W8A8C8-mxfp8 \
     --tensor-parallel-size 8 \
     --max-model-len 524288 \
     --max-num-batched-tokens 32768 \
-    --max-num-seqs 16 \
+    --max-num-seqs 32 \
     --block-size 128 \
     --trust-remote-code \
     --reasoning-parser iquest_q1 \
@@ -86,7 +87,8 @@ exec /usr/local/python3.12.16/bin/vllm serve /models/IQuest-Q1-W8A8C8-mxfp8 \
     --kv-transfer-config '{"kv_connector":"MultiConnector","kv_role":"kv_producer","kv_port":28010,"engine_id":"0","kv_connector_extra_config":{"connectors":[{"kv_connector":"MooncakeHybridConnector","kv_role":"kv_producer","kv_port":28010,"kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":8},"decode":{"dp_size":1,"tp_size":8}}},{"kv_connector":"AscendStoreConnector","kv_role":"kv_producer","kv_connector_extra_config":{"lookup_rpc_port":"0","backend":"mooncake","use_layerwise":false}}]}}' \
     --enable-prefix-caching \
     --enforce-eager \
-    --additional-config '{"enable_fused_mc2":1,"enable_iquest_triton_qk_norm":1,"enable_fused_o_proj_ar":1}' \
+    --additional-config '{"enable_fused_mc2":1,"enable_iquest_triton_qk_norm":1,"enable_fused_o_proj_ar":1,"enable_flashcomm1":true,"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}' \
     --profiler-config '{"profiler":"torch","torch_profiler_dir":"/pd/logs/profile/prefill","torch_profiler_with_stack":false}' \
     --enable-expert-parallel \
+    --async-scheduling \
     --quantization ascend

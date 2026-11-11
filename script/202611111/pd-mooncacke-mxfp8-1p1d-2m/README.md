@@ -127,7 +127,7 @@ TS=$(date +%Y%m%d_%H%M%S)
 ssh root@10.222.46.181 'ss -ltn | grep 50088' || \
 ssh root@10.222.46.181 'docker exec -d pd-mooncacke-p bash /pd/mooncake/run_master.sh'
 
-# ② decode（47.74；实测约 3.5 min 就绪，含 25 档图捕获 + MTP）
+# ② decode（47.74；实测约 3.5 min 就绪，含 13 档图捕获 + MTP）
 ssh root@10.222.47.74 "docker exec -d pd-mooncacke-d bash -c \
   'bash /pd/decode/d.sh >> $D/logs/decode/engine-${TS}.log 2>&1'"
 
@@ -198,22 +198,22 @@ npu-smi info -t proc-mem -i 0
 **假绿**：进程列表里有 `vllm serve`、但 7100 无监听且 NPU 不占卡 = 上次启动死在 spawn 阶段的
 残留僵尸（Ctrl+C 只杀会话不杀引擎）。必须清干净、确认 `proc-mem` 为 "No process" 再重启。
 
-## 7. 生效配置（2026-11-10 21:07 实测，取自进程实际命令行）
+## 7. 生效配置（2026-11-11 三改后的脚本口径；资源实测数据仍取自 11-11 11:44 那次运行）
 
 | 项 | prefill（`p.sh`，46.181） | decode（`d.sh`，47.74） |
 |---|---|---|
 | 模型 | `/models/IQuest-Q1-W8A8C8-mxfp8` + `--quantization ascend`（**KV=float，C8 未启用**） | 同左 |
 | 并行 | TP8 + `--enable-expert-parallel` | TP8 + EP |
-| 模式 | `--enforce-eager`（P 无图模式） | `FULL_DECODE_ONLY` + `npugraph_ex`，25 档 capture sizes |
+| 模式 | `--enforce-eager`（P 无图模式） | `FULL_DECODE_ONLY` + `npugraph_ex`，13 档 capture sizes（1…128） |
 | 上下文 | `--max-model-len 524288` | `--max-model-len 524288` |
-| 批次 | `--max-num-batched-tokens 32768`、`--max-num-seqs 16` | `--max-num-batched-tokens 1024`、`--max-num-seqs 64` |
+| 批次 | `--max-num-batched-tokens 32768`、`--max-num-seqs 32` | `--max-num-batched-tokens 256`、`--max-num-seqs 64` |
 | block-size | 128 | 128 |
-| 显存 | `--gpu-memory-utilization 0.90` | `0.94` + `--kv-cache-memory 34359738368`（32 GiB 硬 pin） |
+| 显存 | `--gpu-memory-utilization 0.90` | `0.94`（不 pin `--kv-cache-memory`，容量自动推导） |
 | prefix caching | **开**（池查找依赖） | 关 |
 | KV 传输 | producer `28010`, engine_id 0 | consumer `29010`, engine_id 1 |
 | MTP | — | `eagle`，`/models/IQuest-Q1/mtp`，depth 3 |
-| 调度 | — | `--async-scheduling` |
-| additional_config | `enable_fused_mc2` + `enable_iquest_triton_qk_norm` + `enable_fused_o_proj_ar` | 上面三项 + `enable_cpu_binding` + `multistream_overlap_shared_expert` + `recompute_scheduler_enable` + `ascend_compilation_config` |
+| 调度 | `--async-scheduling` | `--async-scheduling` |
+| additional_config | `enable_fused_mc2` + `enable_iquest_triton_qk_norm` + `enable_fused_o_proj_ar` + `enable_flashcomm1` + `enable_cpu_binding` + `multistream_overlap_shared_expert` | 上面三项 + `enable_cpu_binding` + `multistream_overlap_shared_expert` + `recompute_scheduler_enable` + `ascend_compilation_config` |
 | profiler | `torch` → `/pd/logs/profile/prefill` | `torch` → `/pd/logs/profile/decode` |
 
 两个连接器（两侧一致）：`MultiConnector` = `MooncakeHybridConnector` + `AscendStoreConnector`
@@ -224,24 +224,24 @@ npu-smi info -t proc-mem -i 0
 | 项 | P | D |
 |---|---|---|
 | 就绪耗时（从 exec 到 `/health` 200） | ~2 min | ~3.5 min |
-| KV blocks | 7260（`Available KV cache memory: 39.00 GiB`） | 5890（32 GiB 硬 pin） |
+| KV blocks | 7260（`Available KV cache memory: 39.00 GiB`） | 5890（32 GiB 硬 pin；三改去掉 pin 后会按 0.94 自动推导，需重测） |
 | 524288 token 请求的并发上限 | 1.77× | 1.44× |
 | HBM/卡 | 85.7–86.4 GB | 80.0–80.7 GB |
 
-### 环境变量（2026-11-10 按 4m 站口径精简，export 行 30 → 21）
+### 环境变量（2026-11-11 三改：与 4m 站对齐，去掉 `spawn`）
 
 | 段 | 内容 |
 |---|---|
 | 网络 | `nic_name=enp39s0f3` / `local_ip` + `VLLM_HOST_IP`、`HCCL_IF_IP`、`GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME`、`HCCL_SOCKET_IFNAME` |
-| 引擎 | `VLLM_USE_V2_MODEL_RUNNER` / `HCCL_OP_EXPANSION_MODE=AIV` / `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000` / `HCCL_BUFFSIZE=400` / `OMP_PROC_BIND=false` / `OMP_NUM_THREADS=10` / `PYTORCH_NPU_ALLOC_CONF` / `ASCEND_RT_VISIBLE_DEVICES=0-7` / `PYTHONUNBUFFERED` / `PYTHONHASHSEED` / `VLLM_WORKER_MULTIPROC_METHOD=spawn` |
+| 引擎 | `VLLM_USE_V2_MODEL_RUNNER` / `HCCL_OP_EXPANSION_MODE=AIV` / `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000` / `HCCL_BUFFSIZE=400` / `OMP_PROC_BIND=false` / `OMP_NUM_THREADS=10` / `PYTORCH_NPU_ALLOC_CONF` / `ASCEND_RT_VISIBLE_DEVICES=0-7` / `PYTHONUNBUFFERED` / `PYTHONHASHSEED` |
 | 库路径 | `LD_LIBRARY_PATH` 追加 mooncake 与 `/usr/local/lib`；`PYTHONPATH` **追加** `/workspace`（不可覆盖） |
 | Mooncake | `MOONCAKE_CONFIG_PATH` / `MOONCAKE_MASTER=10.222.46.181:50088` / `MOONCAKE_GLOBAL_SEGMENT_SIZE=24GB` |
 
 精简掉的是镜像 ENV 里本来就有的（逐项比对过）：3 处 `set_env.sh` sourcing、`CPLUS_INCLUDE_PATH`、
 `SOC_VERSION`、`TASK_QUEUE_ENABLE`、9 个 `ATB_*`、`LCCL_*`。
-唯一保留的"非 4m 口径"项是 `VLLM_WORKER_MULTIPROC_METHOD=spawn`（vLLM 默认 `fork`）。
-spawn 下 worker 会重新 import，所以 `PYTHONPATH` 必须追加式 —— 这是 2026-11-10
-`No module named 'acl'` 事故的直接防线，不要删。
+2026-11-11 三改起，P/D 都与 4m 站一致，**不设** `VLLM_WORKER_MULTIPROC_METHOD`（走 vLLM 默认 `fork`）。
+无论 fork 还是 spawn，`PYTHONPATH` 都必须追加式（整体覆盖会冲掉镜像注入的 acl 路径，
+即 2026-11-10 `No module named 'acl'` 事故），这条不要改。
 
 若编译 bishengir / 静态 kernel 报找不到编译器，再把
 `source .../ascend-toolkit/set_env.sh` 与 `source .../nnal/atb/set_env.sh --cxx_abi=1` 加回。
@@ -272,8 +272,8 @@ spawn 下 worker 会重新 import，所以 `PYTHONPATH` 必须追加式 —— �
 
 ## 9. 取值口径与旧值
 
-当前（2026-11-10 二改）：两侧 `--max-model-len 524288`（等于模型原生 `max_position_embeddings`）；
-P `batched-tokens 32768 / seqs 16`，D `batched-tokens 1024 / seqs 64`。
+当前（2026-11-11 三改，对齐 4m 站）：两侧 `--max-model-len 524288`（等于模型原生 `max_position_embeddings`）；
+P `batched-tokens 32768 / seqs 32`，D `batched-tokens 256 / seqs 64`；P 侧补 `--async-scheduling`。
 
 历史口径（需要时改回，直接编辑对应行）：
 
@@ -281,12 +281,31 @@ P `batched-tokens 32768 / seqs 16`，D `batched-tokens 1024 / seqs 64`。
 |---|---|---|
 | 4.4/4.5 纯P/纯D 配比测试冻结值 | `seqs 8 / batched 32768 / model-len 112024` | `seqs 6 / batched 192 / model-len 131072` |
 | 生产值（更早） | `seqs 32 / batched 8192 / model-len 131072` | `seqs 256 / batched 1024` |
+| 11-10 二改 | `seqs 16 / batched 32768` | `seqs 64 / batched 1024` + `--kv-cache-memory 32GiB` |
 
-⚠️ D 侧 pin 了 `--kv-cache-memory 32GiB`，`max-num-seqs 64` 下的实际块数是 5890；
-调大 `seqs` 或 `model-len` 时先看启动日志里的 `Maximum concurrency for 524,288 tokens`。
+⚠️ 三改后 D 侧**不再 pin** `--kv-cache-memory`，KV 容量由 `--gpu-memory-utilization 0.94` 推导
+（旧口径 32 GiB pin 时为 5890 块）；调大 `seqs` 或 `model-len` 时先看启动日志里的
+`Maximum concurrency for 524,288 tokens`。
 
 ## 10. 变更记录
 
+- **2026-11-11 15:03 — decode 图捕获上限 256 → 128（仅改脚本，服务未重启）**
+  - `decode/d.sh`：`cudagraph_capture_sizes` 由 17 档
+    `[1,2,4,8,16,24,32,48,64,80,96,112,128,160,192,224,256]` 截断为 13 档
+    `[1,2,4,8,16,24,32,48,64,80,96,112,128]`，`cudagraph_mode` 仍为 `FULL_DECODE_ONLY`
+  - 影响：单步 token 数 >128 的批（如 `max-num-seqs 64` × MTP depth 3 满载 = 256）会回落到
+    eager 路径；高并发时段 TPOT 会有抬升，低并发不受影响。若后续要跑满 64 并发，先测这一档
+- **2026-11-11 14:55 — 三改：启动命令与 4m 站逐项对齐（仅改脚本，服务未重启）**
+  - `prefill/p.sh`：`--max-num-seqs 16 → 32`；`--additional-config` 增补
+    `enable_flashcomm1:true`、`enable_cpu_binding:true`、`multistream_overlap_shared_expert:true`；
+    新增 `--async-scheduling`；删除 `export VLLM_WORKER_MULTIPROC_METHOD=spawn`（走 vLLM 默认 `fork`，
+    与 4m 的 `p0.sh`/`d0.sh` 一致）
+  - `decode/d.sh`：`--max-num-batched-tokens 1024 → 256`；删除 `--kv-cache-memory 34359738368`
+    （4m 注释为“不需要指定”，改由 `--gpu-memory-utilization 0.94` 自动推导）
+  - 未对齐项（有意保留）：`--quantization ascend`（4m 是 bf16 无此参数）、TP8 vs TP16、
+    P `gpu-memory-utilization 0.90`、D 13 档 capture sizes（1…128）、`--profiler-config` 输出目录
+  - 影响：**运行中的 P/D 引擎仍是旧配置**，需按 §4 重启后生效；重启前先看
+    `--kv-cache-memory` 取消 pin 后 D 侧 `Available KV cache memory` 是否满足 524288 并发
 - **2026-11-11 11:44 — 迁移到新机器并成功拉起**
   - 站点迁到 **P=`10.222.46.181` (sjsbg-00004) / D=`10.222.47.74` (sjsbg-00003)**；
     `docker_start.sh`（P_IP/D_IP）、`p.sh`/`d.sh`（`local_ip` + `--host`）、

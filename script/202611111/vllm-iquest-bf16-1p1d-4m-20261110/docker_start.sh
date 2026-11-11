@@ -66,8 +66,10 @@ docker run --rm \
   -v "$SFS_REPO":/workspace \
   -v "$DEPLOY_DIR":/pd \
   -w /workspace \
-  -e PYTHONPATH=/workspace \
   -itd "$VLLM_IMAGE" sleep infinity
+# 注意：不要在这里加 -e PYTHONPATH=/workspace。
+# 整体覆盖会冲掉镜像 set_env.sh 注入的 acl 路径，worker spawn 报 No module named 'acl'；
+# 角色脚本内已用追加式 export PYTHONPATH="${PYTHONPATH:-}:/workspace"。
 
 echo "[INFO] 容器 $NAME 已创建（${ROLE} 角色，idle）"
 echo "       SFS 整盘: /mnt/sfs_turbo -> /mnt/sfs_turbo（仓库另挂 /workspace，部署目录另挂 /pd）"
