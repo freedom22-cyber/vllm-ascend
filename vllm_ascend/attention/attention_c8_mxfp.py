@@ -37,6 +37,7 @@ from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -51,7 +52,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 from vllm_ascend.utils import uses_mooncake_connector
 
 if TYPE_CHECKING:
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
 
 
 # KV cache MXFP8 scale layouts, PA_NZ flavor (QFA layout_kv="PA_NZ"; golden
@@ -191,6 +193,22 @@ def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
     if result.page_size_padded is not None and result.page_size_padded < result.unpadded_page_size_bytes:
         raise ValueError("MXFP padded page is smaller than its K/V and scale payload.")
     return result
+
+
+def is_mxfp_cache_spec(spec: "KVCacheSpec") -> bool:
+    """Whether ``spec`` describes an MXFP8 packet-packed KV cache.
+
+    ``--kv-cache-dtype mxfp8`` is a global switch, but
+    ``--kv-cache-dtype-skip-layers`` keeps some layers (every sliding window
+    layer, plus a sliding-window draft model) on the model dtype. vLLM
+    promotes those ``SlidingWindowSpec`` entries to ``FullAttentionSpec``
+    whenever the layers share one block pool -- the hybrid KV cache manager
+    does it, and so does ``unify_hybrid_kv_cache_specs`` when it is disabled for
+    a hybrid model -- so ``type(spec) is FullAttentionSpec`` alone also matches
+    BF16 layers. ``mxfp_cache_spec`` is what marks a layer as MXFP8, and it
+    rewrites the dtype, so test the dtype instead of the global flag.
+    """
+    return type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn
 
 
 def mxfp_paged_cache_views(
